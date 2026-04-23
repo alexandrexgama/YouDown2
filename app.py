@@ -21,12 +21,27 @@ if venv_python.exists() and sys.executable != str(venv_python.absolute()):
     print(f"Re-executando com o ambiente virtual: {venv_python}")
     os.execl(str(venv_python.absolute()), str(venv_python.absolute()), *sys.argv)
 
-import yt_dlp
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_file
-from pyngrok import ngrok
+from jinja2 import TemplateNotFound
 from werkzeug.utils import secure_filename
-from yt_dlp.cookies import SUPPORTED_BROWSERS, SUPPORTED_KEYRINGS
+
+try:
+    import yt_dlp
+    from yt_dlp.cookies import SUPPORTED_BROWSERS, SUPPORTED_KEYRINGS
+    YTDLP_IMPORT_ERROR = None
+except Exception as exc:
+    yt_dlp = None
+    SUPPORTED_BROWSERS = set()
+    SUPPORTED_KEYRINGS = set()
+    YTDLP_IMPORT_ERROR = exc
+
+try:
+    from pyngrok import ngrok
+    NGROK_IMPORT_ERROR = None
+except Exception as exc:
+    ngrok = None
+    NGROK_IMPORT_ERROR = exc
 
 load_dotenv()
 
@@ -39,8 +54,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-UPLOAD_DIR = BASE_DIR / "uploads"
+RUNTIME_DATA_DIR = Path("/tmp/youdown2") if os.getenv("VERCEL") else BASE_DIR
+DOWNLOAD_DIR = RUNTIME_DATA_DIR / "downloads"
+UPLOAD_DIR = RUNTIME_DATA_DIR / "uploads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -321,6 +337,22 @@ def parse_cookies_from_browser(raw_value: str):
     return (browser_name, profile, keyring, container)
 
 
+def require_yt_dlp():
+    if yt_dlp is None:
+        raise RuntimeError(
+            "yt-dlp indisponivel no runtime atual. "
+            f"Detalhe: {YTDLP_IMPORT_ERROR}"
+        )
+
+
+def require_ngrok():
+    if ngrok is None:
+        raise RuntimeError(
+            "ngrok indisponivel no runtime atual. "
+            f"Detalhe: {NGROK_IMPORT_ERROR}"
+        )
+
+
 def get_ydlp_auth_options():
     opts = {}
 
@@ -543,6 +575,7 @@ def download_video(url: str, format_type: str, token: str):
     platform = detect_platform(url)
 
     try:
+        require_yt_dlp()
         base_opts = {
             **build_ydl_opts(progress_hooks=[make_progress_hook(token)]),
             "outtmpl": outtmpl,
@@ -676,6 +709,7 @@ def set_ngrok_state(*, status: str, url=None, error=None):
 def stop_ngrok():
     with ngrok_lock:
         try:
+            require_ngrok()
             ngrok.kill()
             set_ngrok_state(status="stopped", url=None, error=None)
             logger.info("Sessao local do ngrok encerrada.")
@@ -693,6 +727,7 @@ def start_ngrok(force_restart=False):
 
     with ngrok_lock:
         try:
+            require_ngrok()
             set_ngrok_state(status="starting", url=None, error=None)
             if force_restart:
                 ngrok.kill()
@@ -709,17 +744,77 @@ def start_ngrok(force_restart=False):
             logger.error(f"Falha ao iniciar ngrok: {error_text}")
 
 
+def render_index_with_fallback(initial_tab: str):
+    try:
+        return render_template("index.html", initial_tab=initial_tab, flask_port=FLASK_PORT)
+    except TemplateNotFound:
+        return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouDown2</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: grid;
+      min-height: 100vh;
+      place-items: center;
+      padding: 24px;
+    }}
+    main {{
+      max-width: 720px;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.35);
+    }}
+    h1 {{ margin-top: 0; }}
+    code {{
+      background: rgba(148, 163, 184, 0.16);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }}
+    ul {{ line-height: 1.7; }}
+    a {{ color: #93c5fd; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>YouDown2</h1>
+    <p>O deploy na Vercel foi publicado com fallback porque os arquivos de interface <code>templates/</code> e <code>static/</code> nao estao neste repositorio.</p>
+    <p>Tab inicial solicitada: <code>{initial_tab}</code></p>
+    <p>Rotas disponiveis nesta instancia:</p>
+    <ul>
+      <li><code>/api/formats</code></li>
+      <li><code>/api/conversion-formats</code></li>
+      <li><code>/api/info</code></li>
+      <li><code>/api/download</code></li>
+      <li><code>/api/download-batch</code></li>
+      <li><code>/api/progress/&lt;token&gt;</code></li>
+      <li><code>/api/file/&lt;token&gt;</code></li>
+    </ul>
+    <p>Observacao: downloads longos, gravacao local, FFmpeg e ngrok podem ter limitacoes no ambiente serverless da Vercel.</p>
+  </main>
+</body>
+</html>"""
+
+
 @app.route("/")
 def index():
     initial_tab = request.args.get("tab", "download").strip().lower()
     if initial_tab not in {"download", "playlist", "convert"}:
         initial_tab = "download"
-    return render_template("index.html", initial_tab=initial_tab, flask_port=FLASK_PORT)
+    return render_index_with_fallback(initial_tab)
 
 
 @app.route("/browse")
 def browse():
-    return render_template("index.html", initial_tab="playlist", flask_port=FLASK_PORT)
+    return render_index_with_fallback("playlist")
 
 
 @app.route("/api/public-url")
@@ -782,6 +877,7 @@ def get_info():
     platform = detect_platform(url)
 
     try:
+        require_yt_dlp()
         with yt_dlp.YoutubeDL(build_ydl_opts(skip_download=True)) as ydl:
             info = ydl.extract_info(url, download=False)
 
